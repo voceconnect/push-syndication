@@ -1,14 +1,16 @@
 <?php
 
-require_once( dirname( __FILE__ ) . '/class-wp-client-factory.php' );
+require_once( dirname( __FILE__ ) . '/class-syndication-client-factory.php' );
 
 class WP_Push_Syndication_Server {
+
+	const CUSTOM_USER_AGENT = 'WordPress/Syndication Plugin';
 
 	public  $push_syndicate_settings;
 	public  $push_syndicate_default_settings;
 	public  $push_syndicate_transports;
 
-	private $version = '2.0';
+	private $version;
 
 	function __construct() {
 
@@ -19,7 +21,7 @@ class WP_Push_Syndication_Server {
 		// custom columns
 		add_filter( 'manage_edit-syn_site_columns', array( $this, 'add_new_columns' ) );
 		add_action( 'manage_syn_site_posts_custom_column', array( $this, 'manage_columns' ), 10, 2);
- 
+
 		// submenus
 		add_action( 'admin_menu', array( $this, 'register_syndicate_settings' ) );
 
@@ -61,14 +63,14 @@ class WP_Push_Syndication_Server {
 					'publish_posts'      => $capability,
 					'read_private_posts' => $capability
 		);
-				
+
 		$taxonomy_capabilities = array(
 			'manage_terms' => 'manage_categories',
 			'edit_terms'   => 'manage_categories',
 			'delete_terms' => 'manage_categories',
 			'assign_terms' => 'edit_posts',
 		);
-				
+
 		register_post_type( 'syn_site', array(
 			'labels' => array(
 				'name'              => __( 'Sites' ),
@@ -84,13 +86,14 @@ class WP_Push_Syndication_Server {
 			'public'                => false,
 			'show_ui'               => true,
 			'publicly_queryable'    => false,
-			'exclude_from_search'   => false,
+			'exclude_from_search'   => true,
 			'menu_position'         => 80,
 			// @TODO we need a menu icon here
 			'hierarchical'          => false, // @TODO check this
-			'query_var'             => true,
+			'query_var'             => false,
+			'rewrite'               => false,
 			'supports'              => array( 'title' ),
-			'can_export'            => true,
+			'can_export'            => false,
 			'register_meta_box_cb'  => array( $this, 'site_metaboxes' ),
 			'capabilities'          => $post_type_capabilities,
 		));
@@ -131,6 +134,8 @@ class WP_Push_Syndication_Server {
 
 		$this->push_syndicate_settings = wp_parse_args( (array) get_option( 'push_syndicate_settings' ), $this->push_syndicate_default_settings );
 
+		$this->version = get_option( 'syn_version' );
+
 	}
 
 	public function register_syndicate_actions() {
@@ -143,7 +148,7 @@ class WP_Push_Syndication_Server {
 		$new_columns = array();
 		$new_columns['cb'] = '<input type="checkbox" />';
 		$new_columns['title'] = _x( 'Site Name', 'column name' );
-		$new_columns['mode'] = _x( 'Mode', 'column name' );
+		$new_columns['client-type'] = _x( 'Client Type', 'column name' );
 		$new_columns['syn_sitegroup'] = _x( 'Groups', 'column name' );
 		$new_columns['date'] = _x('Date', 'column name');
 		return $new_columns;
@@ -152,9 +157,15 @@ class WP_Push_Syndication_Server {
 	public function manage_columns( $column_name, $id ) {
 		global $wpdb;
 		switch ( $column_name ) {
-			case 'mode':
-				$transport_mode = get_post_meta( $id, 'syn_transport_mode', true);
-				echo esc_html( $transport_mode );
+			case 'client-type':
+				$transport_type = get_post_meta( $id, 'syn_transport_type', true );
+				try {
+					$client = Syndication_Client_Factory::get_client( $transport_type, $id );
+					$client_data = $client->get_client_data();
+					echo esc_html( sprintf( '%s (%s)', $client_data['name'], array_shift( $client_data['modes'] ) ) );
+				} catch ( Exception $e ) {
+					printf( __( 'Unknown (%s)', 'push-syndication' ), esc_html( $transport_type ) );
+				}
 				break;
 			case 'syn_sitegroup':
 				the_terms( $id, 'syn_sitegroup', '', ', ', '' );
@@ -163,42 +174,45 @@ class WP_Push_Syndication_Server {
 				break;
 		}
 	}
-	
+
 	public function admin_init() {
 		// @TODO define more parameters
-		$name_match = '#class-wp-(.+)-client\.php#';
-		
+		$name_match = '#class-syndication-(.+)-client\.php$#';
+
 		$full_path = __DIR__ . '/';
 		if ( $handle = opendir( $full_path ) ) {
 			while ( false !== ( $entry = readdir( $handle ) ) ) {
 				if ( !preg_match( $name_match, $entry, $matches ) )
 					continue;
 				require_once( $full_path . $entry );
-				$class_name = 'WP_' . strtoupper( $matches[1] ) . '_Client';
+				$class_name = 'Syndication_' . strtoupper( str_replace( '-', '_', $matches[1] ) ) . '_Client';
+
 				if ( !class_exists( $class_name ) )
 					continue;
 				$client_data = call_user_func( array( $class_name, 'get_client_data' ) );
 				if ( is_array( $client_data ) && !empty( $client_data ) ) {
-					$this->push_syndicate_transports[$client_data['id']] = array( 'name' => $client_data['name'], 'modes' => $client_data['modes'] ); 
+					$this->push_syndicate_transports[$client_data['id']] = array( 'name' => $client_data['name'], 'modes' => $client_data['modes'] );
 					}
 			}
 		}
 		$this->push_syndicate_transports = apply_filters( 'syn_transports', $this->push_syndicate_transports );
-		// register styles and scripts
-		wp_register_style( 'syn_sites', plugins_url( 'css/sites.css', __FILE__ ), array(), $this->version  );
 
 		// register settings
 		register_setting( 'push_syndicate_settings', 'push_syndicate_settings', array( $this, 'push_syndicate_settings_validate' ) );
 
+		// Maybe run upgrade
+		$this->upgrade();
 	}
 
 	public function load_scripts_and_styles( $hook ) {
-
 		global $typenow;
-		if( $hook == 'edit.php' && $typenow == 'syn_site') {
-			wp_enqueue_style( 'syn_sites' );
+		if ( 'syn_site' == $typenow ) {
+			if( $hook == 'edit.php' ) {
+				wp_enqueue_style( 'syn-edit-sites', plugins_url( 'css/sites.css', __FILE__ ), array(), $this->version );
+			} elseif ( in_array( $hook, array( 'post.php', 'post-new.php' ) ) ) {
+				wp_enqueue_style( 'syn-edit-site', plugins_url( 'css/edit-site.css', __FILE__ ), array(), $this->version );
+			}
 		}
-
 	}
 
 	public function push_syndicate_settings_validate( $raw_settings ) {
@@ -209,7 +223,7 @@ class WP_Push_Syndication_Server {
 		$settings['selected_post_types']        = !empty( $raw_settings['selected_post_types'] ) ? $raw_settings['selected_post_types'] : array() ;
 		$settings['delete_pushed_posts']        = !empty( $raw_settings['delete_pushed_posts'] ) ? $raw_settings['delete_pushed_posts'] : 'off' ;
 		$settings['selected_pull_sitegroups']   = !empty( $raw_settings['selected_pull_sitegroups'] ) ? $raw_settings['selected_pull_sitegroups'] : array() ;
-		$settings['pull_time_interval']         = !empty( $raw_settings['pull_time_interval'] ) ? $raw_settings['pull_time_interval'] : '3600' ;
+		$settings['pull_time_interval']         = !empty( $raw_settings['pull_time_interval'] ) ? max( $raw_settings['pull_time_interval'], 300 ) : '3600';
 		$settings['update_pulled_posts']        = !empty( $raw_settings['update_pulled_posts'] ) ? $raw_settings['update_pulled_posts'] : 'off' ;
 
 		$this->pre_schedule_pull_content( $settings['selected_pull_sitegroups'] );
@@ -228,7 +242,7 @@ class WP_Push_Syndication_Server {
 		add_settings_field( 'pull_sitegroups_selection', esc_html__( 'select sitegroups', 'push-syndication' ), array( $this, 'display_pull_sitegroups_selection' ), 'push_syndicate_pull_sitegroups', 'push_syndicate_pull_sitegroups' );
 
 		add_settings_section( 'push_syndicate_pull_options', esc_html__( 'Pull Options' , 'push-syndication' ), array( $this, 'display_pull_options_description' ), 'push_syndicate_pull_options' );
-		add_settings_field( 'pull_time_interval', esc_html__( 'specify time interval in seconds', 'push-syndication' ), array( $this, 'display_time_interval_selection' ), 'push_syndicate_pull_options', 'push_syndicate_pull_options' );
+		add_settings_field( 'pull_time_interval', esc_html__( 'Specify time interval in seconds', 'push-syndication' ), array( $this, 'display_time_interval_selection' ), 'push_syndicate_pull_options', 'push_syndicate_pull_options' );
 		add_settings_field( 'update_pulled_posts', esc_html__( 'update pulled posts', 'push-syndication' ), array( $this, 'display_update_pulled_posts_selection' ), 'push_syndicate_pull_options', 'push_syndicate_pull_options' );
 
 		add_settings_section( 'push_syndicate_post_types', esc_html__( 'Post Types' , 'push-syndication' ), array( $this, 'display_push_post_types_description' ), 'push_syndicate_post_types' );
@@ -573,7 +587,6 @@ class WP_Push_Syndication_Server {
 		global $post;
 
 		$transport_type = get_post_meta( $post->ID, 'syn_transport_type', true);
-		$transport_mode = get_post_meta( $post->ID, 'syn_transport_mode', true);
 		$site_enabled   = get_post_meta( $post->ID, 'syn_site_enabled', true);
 
 		// default values
@@ -587,8 +600,7 @@ class WP_Push_Syndication_Server {
 		$this->display_transports( $transport_type, $transport_mode );
 
 		try {
-			$class = $transport_type . '_client';
-			WP_Client_Factory::display_client_settings( $post, $class );
+			Syndication_Client_Factory::display_client_settings( $post, $transport_type );
 		} catch( Exception $e ) {
 			echo $e;
 		}
@@ -611,15 +623,8 @@ class WP_Push_Syndication_Server {
 		$values = array();
 		$max_len = 0;
 		foreach( $this->push_syndicate_transports as $key => $value ) {
-			if ( $key == $transport_type )
-				$modes = $value['modes'];
-			echo '<option value="' . esc_html( $key ) . '"' . selected( $key, $transport_type ) . '>' . esc_html( $value['name'] ) . '</option>';
-		}
-
-		echo '</select>';
-		echo '<select name="transport_mode" onchange="this.form.submit()">';
-		foreach( $modes as $supported_mode ) {
-			echo '<option value="' . esc_html( $supported_mode ) . '"' . selected( $supported_mode, $mode ) . '>' . esc_html( $supported_mode ) . '</option>';
+			$mode = array_shift( $value['modes'] );
+			echo '<option value="' . esc_html( $key ) . '"' . selected( $key, $transport_type ) . '>' . sprintf( esc_html__( '%s (%s)' ), $value['name'], $mode ) . '</option>';
 		}
 		echo '</select>';
 		echo '</form>';
@@ -638,18 +643,18 @@ class WP_Push_Syndication_Server {
 		if( !isset( $_POST['site_settings_noncename'] ) || !wp_verify_nonce( $_POST['site_settings_noncename'], plugin_basename( __FILE__ ) ) )
 			return;
 
+		$transport_type = sanitize_text_field( $_POST['transport_type'] ); // TODO: validate this exists
+
 		// @TODO validate that type and mode are valid
-		update_post_meta( $post->ID, 'syn_transport_type', sanitize_text_field( $_POST['transport_type'] ) );
-		update_post_meta( $post->ID, 'syn_transport_mode', sanitize_text_field( $_POST['transport_mode'] ) );
-		
+		update_post_meta( $post->ID, 'syn_transport_type', $transport_type );
+
 		$site_enabled = sanitize_text_field( $_POST['site_enabled'] );
-		$class = $_POST['transport_type'] . '_Client';
 
 		try {
-			$save = WP_Client_Factory::save_client_settings( $post->ID, $class );
+			$save = Syndication_Client_Factory::save_client_settings( $post->ID, $transport_type );
 			if( !$save )
 				return;
-			$client = WP_Client_Factory::get_client( $_POST['transport_type'], $post->ID );
+			$client = Syndication_Client_Factory::get_client( $transport_type, $post->ID );
 
 			if( $client->test_connection()  ) {
 				add_filter('redirect_post_location', create_function( '$location', 'return add_query_arg("message", 251, $location);' ) );
@@ -761,8 +766,6 @@ class WP_Push_Syndication_Server {
 
 		global $post;
 
-		// @TODO add cap check
-
 		// autosave verification
 		if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE )
 			return;
@@ -774,7 +777,7 @@ class WP_Push_Syndication_Server {
 		if ( ! $this->current_user_can_syndicate() )
 			return;
 
-		$selected_sitegroups = !empty( $_POST['selected_sitegroups'] ) ? $_POST['selected_sitegroups'] : '' ;
+		$selected_sitegroups = !empty( $_POST['selected_sitegroups'] ) ? array_map( 'sanitize_key', $_POST['selected_sitegroups'] ) : '' ;
 		update_post_meta( $post->ID, '_syn_selected_sitegroups', $selected_sitegroups );
 
 	}
@@ -824,8 +827,6 @@ class WP_Push_Syndication_Server {
 
 		/** start of critical section **/
 
-		require_once( dirname( __FILE__ ) . '/class-wp-client-factory.php' );
-
 		$post_ID = $sites['post_ID'];
 
 		// an array containing states of sites
@@ -837,7 +838,7 @@ class WP_Push_Syndication_Server {
 			foreach( $sites['selected_sites'] as $site ) {
 
 				$transport_type = get_post_meta( $site->ID, 'syn_transport_type', true);
-				$client         = WP_Client_Factory::get_client( $transport_type  ,$site->ID );
+				$client         = Syndication_Client_Factory::get_client( $transport_type  ,$site->ID );
 				$info           = $this->get_site_info( $site->ID, $slave_post_states, $client );
 
 				if( $info['state'] == 'new' || $info['state'] == 'new-error' ) { // states 'new' and 'new-error'
@@ -845,17 +846,17 @@ class WP_Push_Syndication_Server {
 					$push_new_shortcircuit = apply_filters( 'syn_pre_push_new_post_shortcircuit', false, $post_ID, $site, $transport_type, $client, $info );
 					if ( true === $push_new_shortcircuit )
 						continue;
-					
+
 					$result = $client->new_post( $post_ID );
 
 					do_action( 'syn_post_push_new_post', $result, $post_ID, $site, $transport_type, $client, $info );
-					
+
 					$this->validate_result_new_post( $result, $slave_post_states, $site->ID, $client );
 				} else { // states 'success', 'edit-error' and 'remove-error'
 					$push_edit_shortcircuit = apply_filters( 'syn_pre_push_edit_post_shortcircuit', false, $post_ID, $site, $transport_type, $client, $info );
 					if ( true === $push_edit_shortcircuit )
 						continue;
-					
+
 					$result = $client->edit_post( $post_ID, $info['ext_ID'] );
 
 					do_action( 'syn_post_push_edit_post', $result, $post_ID, $site, $transport_type, $client, $info );
@@ -872,7 +873,7 @@ class WP_Push_Syndication_Server {
 			foreach( $sites['removed_sites'] as $site ) {
 
 				$transport_type = get_post_meta( $site->ID, 'syn_transport_type', true);
-				$client         = WP_Client_Factory::get_client( $transport_type  ,$site->ID );
+				$client         = Syndication_Client_Factory::get_client( $transport_type  ,$site->ID );
 				$info           = $this->get_site_info( $site->ID, $slave_post_states, $client );
 
 				// if the post is not pushed we do not need to delete them
@@ -969,7 +970,7 @@ class WP_Push_Syndication_Server {
 
 		$results = new WP_Query(array(
 			'post_type'         => 'syn_site',
-			'posts_per_page'    => -1, // retrieve all posts
+			'posts_per_page'    => 100,
 			'tax_query'         => array(
 				array(
 					'taxonomy'  => 'syn_sitegroup',
@@ -1081,8 +1082,6 @@ class WP_Push_Syndication_Server {
 
 	public function delete_content( $post_ID ) {
 
-		require_once( dirname( __FILE__ ) . '/class-wp-client-factory.php' );
-
 		$delete_error_sites = get_option( 'syn_delete_error_sites' );
 		$delete_error_sites = !empty( $delete_error_sites ) ? $delete_error_sites : array() ;
 		$slave_posts        = $this->get_slave_posts( $post_ID );
@@ -1098,17 +1097,17 @@ class WP_Push_Syndication_Server {
 			if( $site_enabled == 'on' ) {
 
 				$transport_type = get_post_meta( $site_ID, 'syn_transport_type', true);
-				$client         = WP_Client_Factory::get_client( $transport_type , $site_ID );
+				$client         = Syndication_Client_Factory::get_client( $transport_type , $site_ID );
 
 				if( $client->is_post_exists( $ext_ID ) ) {
 					$push_delete_shortcircuit = apply_filters( 'syn_pre_push_delete_post_shortcircuit', false, $ext_ID, $post_ID, $site_ID, $transport_type, $client );
 					if ( true === $push_delete_shortcircuit )
 						continue;
-					
+
 					$result = $client->delete_post( $ext_ID );
 
 					do_action( 'syn_post_push_delete_post', $result, $ext_ID, $post_ID, $site_ID, $transport_type, $client );
-					
+
 					if( !$result ) {
 						$delete_error_sites[ $site_ID ] = array( $ext_ID );
 					}
@@ -1156,7 +1155,7 @@ class WP_Push_Syndication_Server {
 	public function cron_add_pull_time_interval( $schedules ) {
 
 		// Adds the custom time interval to the existing schedules.
-		$schedules['pull_time_interval'] = array(
+		$schedules['syn_pull_time_interval'] = array(
 			'interval' => intval( $this->push_syndicate_settings['pull_time_interval'] ),
 			'display' => __( 'Pull Time Interval', 'push-syndication' )
 		);
@@ -1178,7 +1177,7 @@ class WP_Push_Syndication_Server {
 			$sites = array_merge( $sites, $this->get_sites_by_sitegroup( $selected_sitegroup ) );
 		}
 
-		
+
 		$this->schedule_pull_content( $sites );
 
 	}
@@ -1188,73 +1187,167 @@ class WP_Push_Syndication_Server {
 		// we are saving it as a siteoption
 		$old_pull_sites = get_option( 'syn_old_pull_sites' );
 
-		if( !empty( $old_pull_sites ) ) {
+		if( ! empty( $old_pull_sites ) ) {
 			$timestamp = wp_next_scheduled( 'syn_pull_content', array( $old_pull_sites ) );
 			if( $timestamp )
-				wp_unschedule_event( $timestamp, 'syn_pull_content', array( $old_pull_sites ) );
+				wp_clear_scheduled_hook( 'syn_pull_content', array( $old_pull_sites ) );
+
+			wp_clear_scheduled_hook( 'syn_pull_content' );
 		}
 
 		wp_schedule_event(
 			time() - 1,
-			'pull_time_interval',
+			'syn_pull_time_interval',
 			'syn_pull_content',
-			array( $sites )
+			array()
 		);
 
 		update_option( 'syn_old_pull_sites', $sites );
 	}
 
+	public function pull_get_selected_sites() {
+		$selected_sitegroups = $this->push_syndicate_settings['selected_pull_sitegroups'];
+
+		$sites = array();
+		foreach( $selected_sitegroups as $selected_sitegroup ) {
+			$sites = array_merge( $sites, $this->get_sites_by_sitegroup( $selected_sitegroup ) );
+		}
+
+		// Order by last update date
+		usort( $sites, array( $this, 'sort_sites_by_last_pull_date' ) );
+
+		return $sites;
+	}
+
+	private function sort_sites_by_last_pull_date( $site_a, $site_b ) {
+		$site_a_pull_date = (int) get_post_meta( $site_a->ID, 'syn_last_pull_time', true );
+		$site_b_pull_date = (int) get_post_meta( $site_b->ID, 'syn_last_pull_time', true );
+
+		if ( $site_a_pull_date == $site_b_pull_date )
+			return 0;
+
+		return ( $site_a_pull_date < $site_b_pull_date ) ? -1 : 1;
+	}
+
 	public function pull_content( $sites ) {
+		add_filter( 'http_headers_useragent', array( $this, 'syndication_user_agent' ) );
+
+		if ( empty( $sites ) )
+			$sites = $this->pull_get_selected_sites();
 
 		foreach( $sites as $site ) {
+			$site_id = $site->ID;
 
-			$site_enabled = get_post_meta( $site->ID, 'syn_site_enabled', true );
+			$site_enabled = get_post_meta( $site_id, 'syn_site_enabled', true );
 			if( $site_enabled != 'on' )
 				continue;
 
-			$inserted_posts = get_post_meta( $site->ID, 'syn_inserted_posts', true );
-			$transport_type = get_post_meta( $site->ID, 'syn_transport_type', true );
-			$client         = WP_Client_Factory::get_client( $transport_type, $site->ID );
-			$posts          = $client->get_posts();
+			$transport_type = get_post_meta( $site_id, 'syn_transport_type', true );
+			$client         = Syndication_Client_Factory::get_client( $transport_type, $site_id );
+			$posts          = apply_filters( 'syn_pre_pull_posts', $client->get_posts(), $site, $client );
 
-			if( empty( $posts ) )
-				continue;
+			$post_types_processed = array();
 
 			foreach( $posts as $post ) {
-				if( in_array( $post['post_guid'], $inserted_posts ) ) {
+
+				if ( ! in_array( $post['post_type'], $post_types_processed ) ) {
+					remove_post_type_support( $post['post_type'], 'revisions' );
+					$post_types_processed[] = $post['post_type'];
+				}
+
+				if ( empty( $post['post_guid'] ) )
+					continue;
+
+				$post_id = $this->find_post_by_guid( $post['post_guid'], $post, $site );
+
+				if ( $post_id ) {
 					$pull_edit_shortcircuit = apply_filters( 'syn_pre_pull_edit_post_shortcircuit', false, $post, $site, $transport_type, $client );
 					if ( true === $pull_edit_shortcircuit )
 						continue;
-				
+
 					// if updation is disabled continue
 					if( $this->push_syndicate_settings['update_pulled_posts'] != 'on' )
 						continue;
 
-					$post['ID'] = array_search( $post['post_guid'], $inserted_posts );
+					$post['ID'] = $post_id;
+
+					$post = apply_filters( 'syn_pull_edit_post', $post, $site, $client );
+
 					$result = wp_update_post( $post, true );
 
 					do_action( 'syn_post_pull_edit_post', $result, $post, $site, $transport_type, $client );
-					
+
 				} else {
 					$pull_new_shortcircuit = apply_filters( 'syn_pre_pull_new_post_shortcircuit', false, $post, $site, $transport_type, $client );
 					if ( true === $pull_new_shortcircuit )
 						continue;
-				
+
+					$post = apply_filters( 'syn_pull_new_post', $post, $site, $client );
+
 					$result = wp_insert_post( $post, true );
 
 					do_action( 'syn_post_pull_new_post', $result, $post, $site, $transport_type, $client );
-					
-					if( !is_wp_error( $result ) )
-						$inserted_posts[ $result ] = $post['post_guid'];
+
+					if( !is_wp_error( $result ) ) {
+						update_post_meta( $result, 'syn_post_guid', $post['post_guid'] );
+						update_post_meta( $result, 'syn_source_site_id', $site_id );
+					}
 
 				}
-
 			}
 
-			update_post_meta( $site->ID, 'syn_inserted_posts', $inserted_posts );
+			foreach ( $post_types_processed as $post_type ) {
+				add_post_type_support( $post_type, 'revisions' );
+			}
 
+			update_post_meta( $site_id, 'syn_last_pull_time', current_time( 'timestamp', 1 ) );
 		}
 
+		remove_filter( 'http_headers_useragent', array( $this, 'syndication_user_agent' ) );
+	}
+
+	public function syndication_user_agent( $user_agent ) {
+		return apply_filters( 'syn_pull_user_agent', self::CUSTOM_USER_AGENT );
+	}
+
+	function find_post_by_guid( $guid, $post, $site ) {
+		global $wpdb;
+
+		$post_id = apply_filters( 'syn_pre_find_post_by_guid', false, $guid, $post, $site );
+		if ( false !== $post_id )
+			return $post_id;
+
+		// A direct query here is way more efficient than WP_Query, because we don't have to do all the extra processing, filters, and JOIN.
+		$post_id = $wpdb->get_var( $wpdb->prepare( "SELECT post_id FROM $wpdb->postmeta WHERE meta_key = 'syn_post_guid' AND meta_value = %s LIMIT 1", $guid ) );
+
+		if ( $post_id )
+			return $post_id;
+
+		return false;
+	}
+
+	private function upgrade() {
+		global $wpdb;
+
+		if ( version_compare( $this->version, SYNDICATION_VERSION, '>=' ) )
+			return;
+
+		// upgrade to 2.1
+		if ( version_compare( $this->version, '2.0', '<=' ) ) {
+			$inserted_posts_by_site = $wpdb->get_col( "SELECT post_id FROM $wpdb->postmeta WHERE meta_key = 'syn_inserted_posts'" );
+			foreach ( $inserted_posts_by_site as $site_id ) {
+				$inserted_posts = get_post_meta( $site_id, 'syn_inserted_posts', true );
+
+				foreach ( $inserted_posts as $inserted_post_id => $inserted_post_guid ) {
+					update_post_meta( $inserted_post_id, 'syn_post_guid', $inserted_post_guid );
+					update_post_meta( $inserted_post_id, 'syn_source_site_id', $site_id );
+				}
+			}
+
+			update_option( 'syn_version', '2.1' );
+		}
+
+		update_option( 'syn_version', SYNDICATION_VERSION );
 	}
 
 }
